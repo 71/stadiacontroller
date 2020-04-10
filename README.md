@@ -17,8 +17,8 @@ on Windows.
   everything just works. There won't be pesky Denuvo games that refuse to accept that input.
 
 ### Installation
-1. Install [ViGEm](https://github.com/ViGEm/Home).
-2. Download a release from the [releases]() page.
+1. Install [ViGEm](https://github.com/ViGEm/ViGEmBus/releases).
+2. Download a release from the [releases](https://github.com/71/stadiacontroller/releases) page.
 3. Extract the zip into a directory.
 
 ### Alternative
