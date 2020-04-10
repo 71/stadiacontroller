@@ -105,6 +105,10 @@ func runButtonPress(pressed bool, ifPressed, ifReleased string) error {
 func runCommand(cmd string) error {
 	command := exec.Command(*shell, "/C", cmd)
 
+	if err := command.Start(); err != nil {
+		return err
+	}
+
 	go func() {
 		err := command.Wait()
 
@@ -113,5 +117,5 @@ func runCommand(cmd string) error {
 		}
 	}()
 
-	return command.Start()
+	return nil
 }
