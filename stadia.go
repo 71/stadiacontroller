@@ -1,7 +1,9 @@
 package stadiacontroller
 
 import (
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"log"
 	"time"
 )
@@ -18,7 +20,7 @@ type StadiaController struct {
 }
 
 func NewStadiaController() *StadiaController {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(5000 * time.Millisecond)
 	controller := &StadiaController{nil, ticker, nil}
 
 	go func() {
@@ -110,7 +112,7 @@ func ParseReport(data []byte, report *Xbox360ControllerReport) error {
 		return errors.New("cannot parse empty report")
 	}
 
-	if data[0] == 0x03 && len(data) == 10 {
+	if data[0] == 0x03 && len(data) >= 10 {
 		a := data[1]
 		b := data[2]
 		c := data[3]
@@ -186,7 +188,7 @@ func ParseReport(data []byte, report *Xbox360ControllerReport) error {
 		return nil
 	}
 
-	return errors.New("unknown report format")
+	return fmt.Errorf("unknown report format; raw report was %s", base64.StdEncoding.EncodeToString(data))
 }
 
 func convertAxisValue(byteValue byte) int32 {
