@@ -378,10 +378,11 @@ func (d *winDevice) readThread() {
 		if buf[0] == 0 {
 			// Report numbers are not being used, so remove zero to match other platforms
 			buf = buf[1:]
+			n--
 		}
 
 		select {
-		case d.readCh <- buf[:int(n-1)]:
+		case d.readCh <- buf[:int(n)]:
 		default:
 		}
 	}
