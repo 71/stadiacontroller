@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"time"
 
 	"github.com/71/stadiacontroller"
 )
@@ -63,6 +64,7 @@ func run() error {
 
 		if err != nil {
 			if errors.Is(err, stadiacontroller.RetryError) {
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 			return err

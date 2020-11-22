@@ -20,8 +20,8 @@ type StadiaController struct {
 }
 
 func NewStadiaController() *StadiaController {
-	ticker := time.NewTicker(5000 * time.Millisecond)
-	controller := &StadiaController{nil, ticker, nil}
+	ticker := time.NewTicker(500 * time.Millisecond)
+	controller := &StadiaController{nil, ticker, RetryError}
 
 	go func() {
 		for range ticker.C {
