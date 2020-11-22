@@ -64,7 +64,7 @@ func run() error {
 
 		if err != nil {
 			if errors.Is(err, stadiacontroller.RetryError) {
-				time.Sleep(500 * time.Millisecond)
+				time.Sleep(1 * time.Second)
 				continue
 			}
 			return err

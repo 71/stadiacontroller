@@ -20,8 +20,8 @@ type StadiaController struct {
 }
 
 func NewStadiaController() *StadiaController {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	controller := &StadiaController{nil, ticker, RetryError}
+	ticker := time.NewTicker(1 * time.Second)
+	controller := &StadiaController{nil, ticker, nil}
 
 	go func() {
 		for range ticker.C {
@@ -83,7 +83,11 @@ func (c *StadiaController) GetReport() (Xbox360ControllerReport, error) {
 	report := Xbox360ControllerReport{}
 
 	if c.device == nil {
-		return report, c.err
+		err := c.err
+		if err == nil {
+			err = RetryError
+		}
+		return report, err
 	}
 
 	buf, ok := <-(*c.device).ReadCh()
