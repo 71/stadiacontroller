@@ -13,7 +13,7 @@ on Windows.
     - For instance, `-capture-pressed "sharex -PrintScreen"` takes a screenshot when the Capture
       button is pressed.
 - Vibrations are supported.
-- Emulation via [ViGEm](https://github.com/ViGEm/Home) (must be installed), which means that
+- Emulation via [ViGEm](https://vigem.org) (must be installed), which means that
   everything just works. There won't be pesky Denuvo games that refuse to accept that input.
 
 ### Installation
