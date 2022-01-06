@@ -3,6 +3,14 @@
 Support for using the Stadia Controller as an Xbox 360 controller
 on Windows.
 
+### No longer maintained
+This project is no longer maintained. Please take a look at the following alternatives if you
+have issues with `stadiacontroller`:
+- [StadiEm](https://github.com/MWisBest/StadiEm) seems more stable, but is in C# with no
+  official builds.
+- [XOutput](https://github.com/csutorasa/XOutput) does not support vibrations, analog triggers
+  and additional buttons, but it has more features and is more stable overall.
+
 ### Supported features
 - All buttons are mapped to their Xbox 360 equivalents.
   - Triggers are analog.
@@ -20,7 +28,3 @@ on Windows.
 1. Install [ViGEm](https://github.com/ViGEm/ViGEmBus/releases).
 2. Download a release from the [releases](https://github.com/71/stadiacontroller/releases) page.
 3. Extract the zip into a directory.
-
-### Alternative
-[XOutput](https://github.com/csutorasa/XOutput) does not support vibrations,
-analog triggers and additional buttons, but it has more features and is more stable overall.
