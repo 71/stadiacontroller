@@ -1,0 +1,13 @@
+[package]
+name = "stadiacontroller"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+argh = "0.1"
+tokio = { version = "1.16", features = ["fs", "macros", "io-util", "sync", "rt", "rt-multi-thread", "signal", "time"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+vigem = { git = "https://github.com/71/vigem" }
+windows = { version = "0.38", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_HumanInterfaceDevice", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
