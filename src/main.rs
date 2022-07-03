@@ -1,13 +1,7 @@
-use std::{ffi::c_void, process::Command};
-
 use anyhow::Context;
 use argh::FromArgs;
-use tokio::sync::watch;
-use vigem::XUSBReport;
 
 mod stadia;
-
-use stadia::Controller;
 
 #[derive(FromArgs)]
 /// Emulate an Xbox 360 controller using a Stadia controller.
@@ -33,38 +27,31 @@ struct Args {
     shell: Option<String>,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     // Parse arguments.
-    let args = argh::from_env();
+    let args = argh::from_env::<Args>();
 
-    // Create channels for communication.
-    let (tx_vibration, rx_vibration) = watch::channel(Vibration::default());
-    let (tx_report, rx_report) = watch::channel(XUSBReport::default());
-
-    // Spawn loops.
-    let vigem_loop = vigem_loop(rx_report, tx_vibration);
-    let stadia_loop = stadia_loop(args, rx_vibration, tx_report);
-
-    tokio::try_join!(vigem_loop, stadia_loop)?;
-
-    Ok(())
-}
-
-async fn vigem_loop(
-    mut rx_report: watch::Receiver<XUSBReport>,
-    mut tx_vibration: watch::Sender<Vibration>,
-) -> anyhow::Result<()> {
-    // Create client and target controller.
+    // Connect to ViGEm and create a X360 controller.
     let mut client = vigem::Vigem::new();
 
-    client.connect().context("connecting to vigem")?;
+    client.connect().context("cannot connect to ViGEm")?;
 
     let mut target = vigem::Target::new(vigem::TargetType::Xbox360);
 
     client
         .target_add(&mut target)
-        .context("adding xbox 360 target to vigem")?;
+        .context("cannot add Xbox 360 controller to ViGEm")?;
+
+    // Create Stadia controller.
+    #[derive(Debug)]
+    struct Vibration {
+        large_motor: u8,
+        small_motor: u8,
+    }
+
+    let mut controller = stadia::Controller::new();
+    let (mut tx_vibration, mut rx_vibration) = tokio::sync::mpsc::unbounded_channel();
 
     // Set notifications handler, which forwards vibrations.
     unsafe extern "C" fn handle_notification(
@@ -73,36 +60,19 @@ async fn vigem_loop(
         large_motor: u8,
         small_motor: u8,
         _led_number: u8,
-        tx_vibration: *mut watch::Sender<Vibration>,
+        tx_vibration: *mut tokio::sync::mpsc::UnboundedSender<Vibration>,
     ) {
-        let vibration = Vibration {
+        let _ = (*tx_vibration).send(Vibration {
             large_motor,
             small_motor,
-        };
-
-        (*tx_vibration).send(vibration).unwrap();
+        });
     }
 
-    client.x360_register_notification(&target, Some(handle_notification), &mut tx_vibration)?;
+    client
+        .x360_register_notification(&target, Some(handle_notification), &mut tx_vibration)
+        .context("cannot register ViGEm vibration notification")?;
 
-    // Forward Stadia reports to ViGEm.
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-
-            _ = rx_report.changed() => {
-                target.update(&*rx_report.borrow()).context("updating vigem controller")?;
-            },
-        }
-    }
-}
-
-async fn stadia_loop(
-    args: Args,
-    mut rx_vibration: watch::Receiver<Vibration>,
-    tx_report: watch::Sender<XUSBReport>,
-) -> anyhow::Result<()> {
-    let mut controller = Controller::new();
+    // Run event loop.
     let mut was_assistant_pressed = false;
     let mut was_capture_pressed = false;
 
@@ -111,86 +81,81 @@ async fn stadia_loop(
             // Stop on Ctrl-C.
             _ = tokio::signal::ctrl_c() => return Ok(()),
 
-            // Receive reports and send them to ViGEm.
+            // Forward reports from the Stadia controller to the ViGEm Xbox 360
+            // virtual controller.
             report = controller.read_report() => {
-                let report = report.context("reading controller report")?;
+                let report = report.context("cannot read controller report")?;
 
-                tx_report.send(report.vigem_report)?;
+                target
+                    .update(&report.vigem_report)
+                    .context("cannot forward Stadia controller action to ViGEm")?;
 
-                for (
-                    previously_pressed,
-                    currently_pressed,
-                    command_if_pressed,
-                    command_if_released,
-                ) in [
-                    (
-                        &mut was_assistant_pressed,
+                // Handle presses to the Assistant and Capture buttons.
+                let (assistant_result, capture_result) = tokio::join!(
+                    run_button_press(
+                        args.shell.as_deref(),
                         report.is_assistant_pressed,
+                        &mut was_assistant_pressed,
                         args.assistant_pressed.as_deref(),
                         args.assistant_released.as_deref(),
                     ),
-                    (
-                        &mut was_capture_pressed,
+                    run_button_press(
+                        args.shell.as_deref(),
                         report.is_capture_pressed,
+                        &mut was_capture_pressed,
                         args.capture_pressed.as_deref(),
                         args.capture_released.as_deref(),
                     ),
-                ] {
-                    if *previously_pressed == currently_pressed {
-                        continue;
-                    }
+                );
 
-                    *previously_pressed = currently_pressed;
-
-                    run_button_press(
-                        args.shell.as_deref(),
-                        currently_pressed,
-                        command_if_pressed,
-                        command_if_released,
-                    )?;
-                }
+                assistant_result.context("cannot run Assistant handler")?;
+                capture_result.context("cannot run Capture handler")?;
             },
 
-            // Forward ViGEm vibrations to the Stadia controller.
-            _ = rx_vibration.changed() => {
-                let vibration = rx_vibration.borrow();
-
-                controller.vibrate(vibration.large_motor, vibration.small_motor).context("vibrating controller")?;
+            // Forward vibrations from the ViGEm Xbox 360 virtual controller to
+            // the Stadia controller.
+            Some(Vibration { large_motor, small_motor }) = rx_vibration.recv() => {
+                controller
+                    .vibrate(large_motor, small_motor)
+                    .context("cannot forward vibration to Stadia controller")?;
             },
         }
     }
 }
 
-fn run_button_press(
+/// Runs the command `if_pressed` if `currently_pressed` is true, and the
+/// command `if_released` otherwise. Updates `previously_pressed` to
+/// `currently_pressed`.
+///
+/// If `*previously_pressed == currently_pressed`, does not do anything.
+async fn run_button_press(
     shell: Option<&str>,
-    is_pressed: bool,
+    currently_pressed: bool,
+    previously_pressed: &mut bool,
     if_pressed: Option<&str>,
     if_released: Option<&str>,
 ) -> anyhow::Result<()> {
-    let command_to_run = match (is_pressed, if_pressed, if_released) {
+    if *previously_pressed == currently_pressed {
+        return Ok(());
+    }
+
+    *previously_pressed = currently_pressed;
+
+    let command_to_run = match (currently_pressed, if_pressed, if_released) {
         (true, Some(cmd), _) | (false, _, Some(cmd)) if !cmd.is_empty() => cmd,
         _ => return Ok(()),
     };
     let shell = shell.unwrap_or("cmd");
 
-    let mut child = Command::new(shell)
+    let mut child = tokio::process::Command::new(shell)
         .arg("/C")
         .arg(command_to_run)
         .spawn()
-        .context("starting subprocess")?;
-    let command_str = format!("{shell} /C {command_to_run:?}");
+        .with_context(|| format!("cannot spawn command '{shell} /C {command_to_run:?}'"))?;
 
-    tokio::spawn(async move {
-        if let Err(err) = child.wait() {
-            eprintln!("command '{command_str}' failed: {err}");
-        }
-    });
+    if let Err(err) = child.wait().await {
+        eprintln!("command '{shell} /C {command_to_run:?}' failed: {err}");
+    }
 
     Ok(())
-}
-
-#[derive(Clone, Copy, Default, Debug)]
-struct Vibration {
-    large_motor: u8,
-    small_motor: u8,
 }

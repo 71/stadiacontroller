@@ -1,7 +1,7 @@
 use std::{
     ffi::{c_void, CStr},
     fs::{File, OpenOptions},
-    io::{Error, Write},
+    io::{Error, Write, ErrorKind},
     mem::size_of,
     os::windows::prelude::{AsRawHandle, OpenOptionsExt},
     path::PathBuf,
@@ -23,7 +23,7 @@ use windows::{
             },
             HumanInterfaceDevice::GUID_DEVINTERFACE_HID,
         },
-        Foundation::{BOOLEAN, ERROR_IO_PENDING, HANDLE, HWND},
+        Foundation::{CloseHandle, BOOLEAN, ERROR_IO_PENDING, HANDLE, HWND},
         Storage::FileSystem::{
             ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
         },
@@ -32,94 +32,127 @@ use windows::{
                 CreateEventA, RegisterWaitForSingleObject, ResetEvent, UnregisterWait,
                 WT_EXECUTEINWAITTHREAD, WT_EXECUTEONLYONCE,
             },
-            IO::{GetOverlappedResult, OVERLAPPED},
+            IO::{CancelIo, GetOverlappedResult, OVERLAPPED},
         },
     },
 };
 
 /// A handle to a Stadia controller.
-pub struct Controller {
-    device: Option<File>,
-    read_event: Option<OVERLAPPED>,
-}
+pub struct Controller(Option<AcquiredController>);
 
 impl Controller {
     /// Creates a new [`Controller`] which is not connected to any device.
     pub const fn new() -> Self {
-        Self {
-            device: None,
-            read_event: None,
+        Controller(None)
+    }
+
+    /// Reads a new report sent by the controller.
+    pub async fn read_report(&mut self) -> anyhow::Result<Report> {
+        loop {
+            // Obtain inner controller.
+            let inner = match &mut self.0 {
+                Some(inner) => inner,
+                None => loop {
+                    match AcquiredController::acquire()
+                        .context("cannot connect to Stadia controller")?
+                    {
+                        Some(inner) => {
+                            self.0 = Some(inner);
+
+                            break unsafe { self.0.as_mut().unwrap_unchecked() };
+                        }
+                        None => {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                },
+            };
+
+            // Read from device; a report is expected to have a size of 11.
+            let mut buf = [0; 512];
+            let read_bytes =
+                read_overlapped(inner.device_handle(), &mut inner.overlapped, &mut buf)
+                    .await
+                    .context("cannot read report from Stadia controller")?;
+
+            let read_bytes = match read_bytes {
+                Some(read_bytes) => read_bytes,
+                None => {
+                    // Controller was disconnected; re-acquire it.
+                    self.0 = None;
+
+                    continue;
+                }
+            };
+            let start = if buf[0] == 0 { 1 } else { 0 };
+
+            return Report::try_from(&buf[start..read_bytes as usize]);
         }
     }
 
-    /// Connects the [`Controller`] to a Stadia device if it is not already
-    /// connected, and returns a pointer to it.
-    fn acquire_device(&mut self) -> anyhow::Result<bool> {
+    /// Makes the controller vibrate.
+    pub fn vibrate(&mut self, large_motor: u8, small_motor: u8) -> anyhow::Result<()> {
+        if let Some(inner) = &mut self.0 {
+            write_overlapped(
+                inner.device_handle(),
+                &[0x05, large_motor, large_motor, small_motor, small_motor],
+            )?;
+        }
+
+        Ok(())
+    }
+}
+
+/// A [`Controller`] that was actually acquired.
+struct AcquiredController {
+    device: File,
+    overlapped: OVERLAPPED,
+}
+
+impl AcquiredController {
+    /// Connects to a Stadia device and returns an [`AcquiredController`]
+    /// representing it.
+    fn acquire() -> anyhow::Result<Option<Self>> {
         const STADIA_CONTROLLER_VENDOR_ID: u16 = 0x18D1;
         const STADIA_CONTROLLER_PRODUCT_ID: u16 = 0x9400;
-
-        if self.device.is_some() {
-            return Ok(true);
-        }
 
         let device_path = match find_device_with_vid_and_pid(
             STADIA_CONTROLLER_VENDOR_ID,
             STADIA_CONTROLLER_PRODUCT_ID,
         )? {
             Some(path) => path,
-            None => return Ok(false),
+            None => return Ok(None),
         };
+
         let device = OpenOptions::new()
             .read(true)
             .write(true)
             .share_mode(FILE_SHARE_READ.0 | FILE_SHARE_WRITE.0)
             .custom_flags(FILE_FLAG_OVERLAPPED.0)
-            .open(device_path)?;
-        let read_event = unsafe { CreateEventA(null(), false, false, PCSTR::default())? };
+            .open(device_path)
+            .context("cannot open connection to Stadia controller")?;
 
-        self.device = Some(device);
-        self.read_event = Some(OVERLAPPED {
+        let read_event = unsafe { CreateEventA(null(), false, false, PCSTR::default())? };
+        let overlapped = OVERLAPPED {
             hEvent: read_event,
             ..Default::default()
-        });
+        };
 
-        Ok(true)
+        Ok(Some(AcquiredController { device, overlapped }))
     }
 
-    /// Reads a new report sent by the controller.
-    pub async fn read_report(&mut self) -> anyhow::Result<Report> {
-        // Obtain device.
-        while !self
-            .acquire_device()
-            .context("cannot acquire Stadia controller")?
-        {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-
-        let device = self.device.as_mut().unwrap();
-        let overlapped = self.read_event.as_mut().unwrap();
-
-        // Read from device.
-        let mut buf = [0; 1024];
-        let read_bytes = read_overlapped(device, overlapped, &mut buf)
-            .await
-            .context("reading data")?;
-
-        let start = if buf[0] == 0 { 1 } else { 0 };
-
-        Report::try_from(&buf[start..read_bytes as usize])
+    /// Returns the Windows handle to the underlying Stadia device.
+    fn device_handle(&self) -> HANDLE {
+        HANDLE(self.device.as_raw_handle() as usize as isize)
     }
+}
 
-    /// Makes the controller vibrate.
-    pub fn vibrate(&mut self, large_motor: u8, small_motor: u8) -> anyhow::Result<()> {
-        if let Some(device) = &mut self.device {
-            write_overlapped(
-                device,
-                &[0x05, large_motor, large_motor, small_motor, small_motor],
-            )?;
+impl Drop for AcquiredController {
+    fn drop(&mut self) {
+        unsafe {
+            CancelIo(self.device_handle());
+            CloseHandle(self.overlapped.hEvent);
         }
-
-        Ok(())
     }
 }
 
@@ -144,6 +177,18 @@ impl Report {
     #[inline]
     fn set_button(&mut self, button: vigem::XButton) {
         self.vigem_report.w_buttons |= button;
+    }
+
+    #[inline]
+    fn convert_axis_value(value: u8) -> i32 {
+        let value = value as i32;
+        let value = value << 8 | ((value << 1) & 0b1111);
+
+        if value == 0xfffe {
+            0xffff
+        } else {
+            value
+        }
     }
 }
 
@@ -219,10 +264,10 @@ impl TryFrom<&'_ [u8]> for Report {
             }
         }
 
-        let thumb_lx = convert_axis_value(axes[0]) - 0x8000;
-        let mut thumb_ly = -convert_axis_value(axes[1]) + 0x7fff;
-        let thumb_rx = convert_axis_value(axes[2]) - 0x8000;
-        let mut thumb_ry = -convert_axis_value(axes[3]) + 0x7fff;
+        let thumb_lx = Self::convert_axis_value(axes[0]) - 0x8000;
+        let mut thumb_ly = -Self::convert_axis_value(axes[1]) + 0x7fff;
+        let thumb_rx = Self::convert_axis_value(axes[2]) - 0x8000;
+        let mut thumb_ry = -Self::convert_axis_value(axes[3]) + 0x7fff;
 
         for value in [&mut thumb_ly, &mut thumb_ry] {
             if *value == -1 {
@@ -242,34 +287,6 @@ impl TryFrom<&'_ [u8]> for Report {
 
         Ok(report)
     }
-}
-
-#[inline]
-fn convert_axis_value(value: u8) -> i32 {
-    let value = value as i32;
-    let value = value << 8 | ((value << 1) & 0b1111);
-
-    if value == 0xfffe {
-        0xffff
-    } else {
-        value
-    }
-}
-
-pub fn defer<F: FnOnce()>(f: F) -> impl Drop {
-    struct Defer<F: FnOnce()> {
-        f: Option<F>,
-    }
-
-    impl<F: FnOnce()> Drop for Defer<F> {
-        fn drop(&mut self) {
-            if let Some(drop) = self.f.take() {
-                drop();
-            }
-        }
-    }
-
-    Defer { f: Some(f) }
 }
 
 /// Returns the path to the first device with the given `vid` and `pid`, or
@@ -294,9 +311,12 @@ fn find_device_with_vid_and_pid(vid: u16, pid: u16) -> anyhow::Result<Option<Pat
             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
         )
     }?;
-    let _destroy_device_info_set = defer(|| unsafe {
-        SetupDiDestroyDeviceInfoList(device_info_set);
-    });
+
+    scopeguard::defer! {
+        unsafe {
+            SetupDiDestroyDeviceInfoList(device_info_set);
+        }
+    }
 
     const BUF_SIZE: usize = 4096;
     let mut path_buffer = [0u8; BUF_SIZE];
@@ -406,30 +426,19 @@ fn find_device_with_vid_and_pid(vid: u16, pid: u16) -> anyhow::Result<Option<Pat
     Ok(None)
 }
 
-#[test]
-fn test_acquire() {
-    let mut controller = Controller::new();
-
-    controller.acquire_device().unwrap();
-}
-
-#[tokio::test]
-async fn test_read() {
-    Controller::new().read_report().await.unwrap();
-}
-
-/// Reads once from `file` asynchronously with the given `overlapped` context.
+/// Reads once from `file` asynchronously with the given `overlapped` context,
+/// and returns the number of read bytes. If the file is no longer available,
+/// [`None`] will be returned and the file should be dropped.
 async fn read_overlapped(
-    file: &mut File,
+    handle: HANDLE,
     overlapped: &mut OVERLAPPED,
     buf: &mut [u8],
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<Option<usize>> {
+    // TODO: handle async cancellation.
     unsafe extern "system" fn done_waiting(ctx: *mut c_void, _: BOOLEAN) {
         let tx = Box::from_raw(ctx as *mut oneshot::Sender<()>);
         let _ = tx.send(());
     }
-
-    let handle = HANDLE(file.as_raw_handle() as usize as isize);
 
     // Reset current event.
     unsafe {
@@ -476,17 +485,23 @@ async fn read_overlapped(
         Error::last_os_error()
     );
 
-    let _unregister_wait = defer(|| unsafe {
-        UnregisterWait(wait_handle);
-    });
+    scopeguard::defer! {
+        unsafe {
+            UnregisterWait(wait_handle);
+        }
+    }
 
     rx.await?;
 
     // Wait completed, we can query the number of read bytes (knowing that the
     // buffer was written to).
     let mut read_bytes = 0;
-
     let success = unsafe { GetOverlappedResult(handle, overlapped, &mut read_bytes, false) };
+
+    if !success.as_bool() && Error::last_os_error().kind() == ErrorKind::NotConnected {
+        // TODO: ensure `NotConnected` is the right error.
+        return Ok(None);
+    }
 
     anyhow::ensure!(
         success.as_bool(),
@@ -496,15 +511,12 @@ async fn read_overlapped(
 
     assert_ne!(read_bytes, 0);
 
-    Ok(read_bytes as _)
+    Ok(Some(read_bytes as _))
 }
 
 /// Writes `data` to `file` (with `file` an overlapped file).
-fn write_overlapped(file: &mut File, data: &[u8]) -> anyhow::Result<()> {
-    let handle = HANDLE(file.as_raw_handle() as usize as isize);
-    let mut overlapped = OVERLAPPED {
-        ..Default::default()
-    };
+fn write_overlapped(handle: HANDLE, data: &[u8]) -> anyhow::Result<()> {
+    let mut overlapped = OVERLAPPED::default();
 
     // Start writing.
     let success = unsafe {
