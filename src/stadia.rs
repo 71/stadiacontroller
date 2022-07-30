@@ -1,7 +1,7 @@
 use std::{
     ffi::{c_void, CStr},
     fs::{File, OpenOptions},
-    io::{Error, Write, ErrorKind},
+    io::{Error, Write},
     mem::size_of,
     os::windows::prelude::{AsRawHandle, OpenOptionsExt},
     path::PathBuf,
@@ -23,7 +23,9 @@ use windows::{
             },
             HumanInterfaceDevice::GUID_DEVINTERFACE_HID,
         },
-        Foundation::{CloseHandle, BOOLEAN, ERROR_IO_PENDING, HANDLE, HWND},
+        Foundation::{
+            CloseHandle, BOOLEAN, ERROR_DEVICE_NOT_CONNECTED, ERROR_IO_PENDING, HANDLE, HWND,
+        },
         Storage::FileSystem::{
             ReadFile, WriteFile, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
         },
@@ -434,7 +436,6 @@ async fn read_overlapped(
     overlapped: &mut OVERLAPPED,
     buf: &mut [u8],
 ) -> anyhow::Result<Option<usize>> {
-    // TODO: handle async cancellation.
     unsafe extern "system" fn done_waiting(ctx: *mut c_void, _: BOOLEAN) {
         let tx = Box::from_raw(ctx as *mut oneshot::Sender<()>);
         let _ = tx.send(());
@@ -491,6 +492,9 @@ async fn read_overlapped(
         }
     }
 
+    // If the current read is cancelled (e.g. because a vibration event is
+    // received), the `rx.await` below will return, calling `UnregisterWait`
+    // above. Re-assuing `ReadFile` later will not make us lose any reports.
     rx.await?;
 
     // Wait completed, we can query the number of read bytes (knowing that the
@@ -498,8 +502,10 @@ async fn read_overlapped(
     let mut read_bytes = 0;
     let success = unsafe { GetOverlappedResult(handle, overlapped, &mut read_bytes, false) };
 
-    if !success.as_bool() && Error::last_os_error().kind() == ErrorKind::NotConnected {
-        // TODO: ensure `NotConnected` is the right error.
+    if !success.as_bool()
+        && Error::last_os_error().raw_os_error() == Some(ERROR_DEVICE_NOT_CONNECTED.0 as _)
+    {
+        // Device was disconnected.
         return Ok(None);
     }
 
