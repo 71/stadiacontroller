@@ -87,8 +87,13 @@ impl Controller {
                 }
             };
             let start = if buf[0] == 0 { 1 } else { 0 };
+            let report_bytes = &buf[start..read_bytes as usize];
 
-            return Report::try_from(&buf[start..read_bytes as usize]);
+            if report_bytes.iter().all(|&x| x == 0) {
+                continue;
+            }
+
+            return Report::try_from(report_bytes);
         }
     }
 
@@ -134,7 +139,7 @@ impl AcquiredController {
             .open(device_path)
             .context("cannot open connection to Stadia controller")?;
 
-        let read_event = unsafe { CreateEventA(null(), false, false, PCSTR::default())? };
+        let read_event = unsafe { CreateEventA(null(), false, false, PCSTR::null())? };
         let overlapped = OVERLAPPED {
             hEvent: read_event,
             ..Default::default()
@@ -308,7 +313,7 @@ fn find_device_with_vid_and_pid(vid: u16, pid: u16) -> anyhow::Result<Option<Pat
     let device_info_set = unsafe {
         SetupDiGetClassDevsA(
             &GUID_DEVINTERFACE_HID,
-            PCSTR::default(),
+            PCSTR::null(),
             HWND::default(),
             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE,
         )

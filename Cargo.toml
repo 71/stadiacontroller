@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 argh = "0.1"
-scopeguard = "1.1.0"
+scopeguard = "1.1"
 tokio = { version = "1.19", features = ["process", "macros", "sync", "rt", "signal", "time"] }
 vigem = { git = "https://github.com/71/vigem" }
-windows = { version = "0.38", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_HumanInterfaceDevice", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+windows = { version = "0.39", features = ["Win32_Devices_DeviceAndDriverInstallation", "Win32_Devices_HumanInterfaceDevice", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
