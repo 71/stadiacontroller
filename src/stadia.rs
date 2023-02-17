@@ -6,6 +6,7 @@ use std::{
     os::windows::prelude::{AsRawHandle, OpenOptionsExt},
     path::PathBuf,
     ptr::{null, null_mut},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -86,14 +87,13 @@ impl Controller {
                     continue;
                 }
             };
-            let start = if buf[0] == 0 { 1 } else { 0 };
-            let report_bytes = &buf[start..read_bytes as usize];
+            let start = usize::from(buf[0] == 0);
+            let report_bytes = &buf[start..read_bytes];
 
-            if report_bytes.iter().all(|&x| x == 0) {
-                continue;
+            match Report::try_from(report_bytes) {
+                Ok(report) => return Ok(report),
+                Err(err) => eprintln!("{err}"),
             }
-
-            return Report::try_from(report_bytes);
         }
     }
 
@@ -441,9 +441,23 @@ async fn read_overlapped(
     overlapped: &mut OVERLAPPED,
     buf: &mut [u8],
 ) -> anyhow::Result<Option<usize>> {
+    unsafe fn take_sender(
+        data: *mut (AtomicBool, oneshot::Sender<()>),
+    ) -> Option<oneshot::Sender<()>> {
+        if (*data)
+            .0
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(Box::from_raw(data).1);
+        }
+
+        None
+    }
+
     unsafe extern "system" fn done_waiting(ctx: *mut c_void, _: BOOLEAN) {
-        let tx = Box::from_raw(ctx as *mut oneshot::Sender<()>);
-        let _ = tx.send(());
+        let Some(sender) = take_sender(ctx.cast()) else { return };
+        let _ = sender.send(());
     }
 
     // Reset current event.
@@ -471,7 +485,8 @@ async fn read_overlapped(
 
     // Start wait for the end of the read; completion will be sent to the
     // current function through a `oneshot` channel.
-    let (tx, rx) = oneshot::channel();
+    let (tx, rx) = oneshot::channel::<()>();
+    let tx = Box::into_raw(Box::new((AtomicBool::new(false), tx)));
     let mut wait_handle = HANDLE(0);
 
     let success = unsafe {
@@ -479,28 +494,46 @@ async fn read_overlapped(
             &mut wait_handle,
             overlapped.hEvent,
             Some(done_waiting),
-            Box::into_raw(Box::new(tx)) as *mut c_void,
+            tx as *mut c_void,
             u32::MAX,
             WT_EXECUTEINWAITTHREAD | WT_EXECUTEONLYONCE,
         )
     };
 
-    anyhow::ensure!(
-        success.as_bool(),
-        "cannot register for read completion: {}",
-        Error::last_os_error()
-    );
+    if !success.as_bool() {
+        // SAFETY: `tx` originates from `Box::into_raw()`, and because the call
+        // above failed we have the only reference to `tx`.
+        drop(unsafe { Box::from_raw(tx) });
 
-    scopeguard::defer! {
-        unsafe {
-            UnregisterWait(wait_handle);
-        }
+        anyhow::bail!(
+            "cannot register for read completion: {}",
+            Error::last_os_error()
+        )
     }
 
     // If the current read is cancelled (e.g. because a vibration event is
     // received), the `rx.await` below will return, calling `UnregisterWait`
     // above. Re-assuing `ReadFile` later will not make us lose any reports.
-    rx.await?;
+    let rx_result = rx.await;
+
+    unsafe {
+        // UnregisterWait:
+        //
+        // > Even wait operations that use WT_EXECUTEONLYONCE must be canceled.
+        //
+        // https://learn.microsoft.com/windows/win32/api/winbase/nf-winbase-registerwaitforsingleobject#remarks
+        UnregisterWait(wait_handle);
+    }
+
+    if let Err(err) = rx_result {
+        // SAFETY: `tx` originates from `Box::into_raw()`, the wait is no longer
+        // registered (so its reference to `tx` was destroyed). `take_sender`
+        // ensures that no data races between the cancellation of `rx` and the
+        // `Overlapped` callback happened.
+        drop(unsafe { take_sender(tx) });
+
+        return Err(err.into());
+    }
 
     // Wait completed, we can query the number of read bytes (knowing that the
     // buffer was written to).
